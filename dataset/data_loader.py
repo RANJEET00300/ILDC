@@ -1,49 +1,59 @@
 import torch
-from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-class LongContextDataset(Dataset):
-    def __init__(self, tokenized_data, chunk_size):
-        """
-        tokenized_data: 1D Tensor of token IDs
-        chunk_size: total length of context (e.g., past_len + future_len)
-        """
-        self.chunk_size = chunk_size
+def get_wikipedia_batches(tokenizer_path, batch_size=4, required_length=2561, max_batches=10):
+    """
+    Streams Wikipedia, filters for long articles, and yields uniform batches.
+    """
+    print("⏳ Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    
+    print("🌐 Streaming Wikipedia...")
+    ds = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
+    
+    current_batch_input_ids = []
+    current_batch_attention = []
+    batches_yielded = 0
+    articles_scanned = 0
+    
+    for example in ds:
+        text = example["text"]
+        articles_scanned += 1
         
-        # Drop the remainder to perfectly chunk
-        total_length = len(tokenized_data)
-        num_chunks = total_length // chunk_size
+        # ⚡ FAST FILTERING: 2561 tokens is roughly 10,000+ characters.
+        if len(text) < 10000:
+            continue
+            
+        # Tokenize and truncate exactly to our requirement (2561)
+        inputs = tokenizer(
+            text,
+            truncation=True,
+            max_length=required_length,
+            return_tensors="pt" # returns PyTorch tensors
+        )
         
-        self.data = tokenized_data[:num_chunks * chunk_size].view(num_chunks, chunk_size)
-
-    def __len__(self):
-        return self.data.size(0)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-
-def get_dataloader(model_id="google/gemma-3-1b-it", dataset_name="wikitext", dataset_config="wikitext-2-raw-v1", chunk_size=4096, batch_size=1):
-    print(f"Loading tokenizer {model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    
-    print(f"Loading dataset {dataset_name} ({dataset_config})...")
-    raw_dataset = load_dataset(dataset_name, dataset_config, split="train")
-    
-    # Concatenate all text
-    print("Tokenizing data...")
-    full_text = "\n\n".join(raw_dataset["text"])
-    
-    # We tokenize everything into a single massive 1D tensor
-    # Note: For massive datasets, this should be chunked/streamed. 
-    # For warm-up on wikitext-2, this fits comfortably in RAM.
-    tokens = tokenizer(full_text, return_tensors="pt", truncation=False)["input_ids"].squeeze(0)
-    
-    print(f"Total tokens: {tokens.size(0)}")
-    
-    dataset = LongContextDataset(tokens, chunk_size)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    
-    print(f"Created Dataloader with {len(dataloader)} batches of size {batch_size}x{chunk_size}")
-    return dataloader
+        input_ids = inputs["input_ids"][0]
+        
+        # If the article actually met the requirement (has exactly 2561 tokens)
+        if input_ids.size(0) == required_length:
+            current_batch_input_ids.append(input_ids)
+            current_batch_attention.append(inputs["attention_mask"][0])
+            
+            # When we have enough articles to form a batch
+            if len(current_batch_input_ids) == batch_size:
+                # Stack them into a unified tensor of shape [batch_size, 2561]
+                batch = {
+                    "input_ids": torch.stack(current_batch_input_ids),
+                    "attention_mask": torch.stack(current_batch_attention)
+                }
+                
+                yield batch
+                
+                # Reset for the next batch
+                current_batch_input_ids = []
+                current_batch_attention = []
+                batches_yielded += 1
+               
+                if batches_yielded >= max_batches:
+                    break

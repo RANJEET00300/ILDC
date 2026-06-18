@@ -1,5 +1,5 @@
 # ===================================================================================
-  
+
 
 import os
 import sys
@@ -9,11 +9,13 @@ import torch.nn.functional as F
 from transformers import get_cosine_schedule_with_warmup
 from transformers import AutoModelForCausalLM
 
-from ILDC_Model import ILDC
-from Train_Step import train_step
-from data_loader_xla import get_dataloader_xla
 
-import torch_xla
+from model.ILDC_Model import ILDC
+from train.Train_Step import train_step
+from dataset.data_loader import get_wikipedia_batches
+
+
+import torch_xla 
 import torch_xla.core.xla_model as xm
 import torch_xla.runtime as xr 
 import torch_xla.distributed.xla_multiprocessing as xmp
@@ -31,20 +33,23 @@ Policy Gradient (RL) Version
 class TrainingConfig:
     def __init__(self):
         self.model_id = "google/gemma-3-1b-it"
-        self.dataset_name = "wikitext"
-        self.dataset_config = "wikitext-2-raw-v1"
+        self.dataset_name = "wikimedia/wikipedia"
+        self.dataset_config = "20241101.en"
         self.past_len = 2048    
         self.future_len = 512   
+        self.full_len = 2561
         self.batch_size = 1     
-        self.gradient_accumulation_steps = 16
+        self.gradient_accumulation_steps = 32
         self.learning_rate = 1e-4
         self.epochs = 10
-        self.checkpoint_dir = "checkpoints"
+        self.checkpoint_dir = "kaggle/working/checkpoints/dc_model_step_100.pt"
         self.log_every = 1      
         self.save_every = 100   
         self.lambda_latent = 0.1
         self.lambda_refine = 9.0
-        self.diffusion_steps = 2
+        self.diffusion_steps = 2 # hard training with BPTT
+        self.N_batches = 16384
+
 
         
 def train_fn(index):
@@ -61,10 +66,11 @@ def train_fn(index):
     xm.master_print(f"  World size: {world_size} TPU cores")
     xm.master_print("=" * 60)
     
-    dataloader, sampler = get_dataloader_xla(
-        model_id=config.model_id, dataset_name=config.dataset_name, 
-        dataset_config=config.dataset_config, chunk_size=chunk_size,
-        batch_size=config.batch_size, world_size=world_size, rank=rank
+    dataloader = get_wikipedia_batches(
+        tokenizer_path=config.model_id, 
+        batch_size=config.batch_size, 
+        required_length=config.full_len, 
+        max_batches= config.N_batches  
     )
     mp_dataloader = pl.MpDeviceLoader(dataloader, device)
     
@@ -82,8 +88,7 @@ def train_fn(index):
     # 2. SCHEDULER SETUP (COSINE + WARMUP)
     # ==============================================================================
     grad_accum_steps = config.gradient_accumulation_steps # e.g., 16 or 32
-    total_batches = len(mp_dataloader)
-    total_optim_steps = (total_batches // grad_accum_steps) * config.epochs
+    total_optim_steps = (config.N_batches // grad_accum_steps) * config.epochs
     warmup_steps = int(total_optim_steps * 0.05) # 5% of training is warmup
 
     scheduler = get_cosine_schedule_with_warmup(
@@ -106,14 +111,13 @@ def train_fn(index):
     xm.master_print(f"Starting Training! Total Opt Steps: {total_optim_steps} | Warmup: {warmup_steps}")
 
     for epoch in range(config.epochs):
-        sampler.set_epoch(epoch)
         optimizer.zero_grad()
         
         for batch_idx, full_batch in enumerate(mp_dataloader):
             
             # --- A. Forward Pass ---
             train_loss, loss_items = train_step(
-                ILDC_model, full_batch, 
+                ILDC_model, full_batch["input_ids"], 
                 config.past_len, 
                 config.diffusion_steps, 
                 config
@@ -132,10 +136,10 @@ def train_fn(index):
             # --- C. Optimization Step (Only every 'grad_accum_steps') ---
             if (batch_idx + 1) % grad_accum_steps == 0:
                 
-                # 1. Gradient Clipping (MANDATORY for Diffusion loops)
+                # 1. Gradient Clipping 
                 torch.nn.utils.clip_grad_norm_(ILDC_model.parameters(), max_norm=1.0)
                 
-                # 2. XLA Optimizer Step (Handles TPU graph sync natively)
+                # 2. XLA Optimizer Step 
                 xm.optimizer_step(optimizer)
                 
                 # 3. Scheduler Step & Zero Grad
@@ -152,8 +156,6 @@ def train_fn(index):
                     
                     current_dm_lr = optimizer.param_groups[0]['lr']
 
-                    # Calling .item() here forces a TPU sync, which is perfectly safe 
-                    # because we only do it every config.log_every steps!
                     xm.master_print(
                         f"Epoch {epoch} | Step {global_step}/{total_optim_steps} | "
                         f"Loss: {avg_loss.item():.4f} "
@@ -169,12 +171,11 @@ def train_fn(index):
                 # --- E. Saving Checkpoints ---
                 if global_step > 0 and global_step % config.save_every == 0:
                     checkpoint_path = os.path.join(config.checkpoint_dir, f"dc_model_step_{global_step}.pt")
-                    # xm.save ensures only the master TPU node writes to disk
-                    xm.save(ILDC_model.state_dict(), checkpoint_path)
+                    xm.save(ILDC_model.dc_model.state_dict(), checkpoint_path)
                     xm.master_print(f"--> Saved Checkpoint to {checkpoint_path}")
 
     xm.master_print("Training complete!")
-    xm.save(ILDC_model.state_dict(), os.path.join(config.checkpoint_dir, "dc_model_final.pt"))
+    xm.save(ILDC_model.dc_model.state_dict(), os.path.join(config.checkpoint_dir, "dc_model_final.pt"))
 
 def main():
     os.environ.pop('TPU_PROCESS_ADDRESSES', None)
@@ -186,4 +187,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

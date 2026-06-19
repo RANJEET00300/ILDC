@@ -25,7 +25,7 @@ from torch_xla.distributed.spmd import Mesh
 import numpy as np
 
 """
-ILDC Stage 1 Training — PyTorch XLA (TPU v5e-8)
+ILDC Training — PyTorch XLA 
 =======================================================
 """
 
@@ -41,12 +41,11 @@ class TrainingConfig:
         self.gradient_accumulation_steps = 32
         self.learning_rate = 1e-4
         self.epochs = 10
-        self.checkpoint_dir = "kaggle/working/checkpoints/dc_model_step_100.pt"
+        self.checkpoint_dir = "./checkpoints/dc_model_step_100.pt"
         self.log_every = 1      
         self.save_every = 100   
         self.lambda_latent = 0.1
-        self.lambda_refine = 9.0
-        self.diffusion_steps = 2 # hard training with BPTT
+        self.diffusion_steps = 8
         self.N_batches = 16384
 
 
@@ -70,7 +69,7 @@ def train_fn(index):
         required_length=config.full_len, 
         max_batches= config.N_batches  
     )
-    mp_dataloader = pl.MpDeviceLoader(dataloader, device)
+    # mp_dataloader = pl.MpDeviceLoader(dataloader, device)
     
     xm.master_print("Loading ILDC Model...")
     ILDC_model = ILDC(config.checkpoint_dir, device)
@@ -111,6 +110,8 @@ def train_fn(index):
     for epoch in range(config.epochs):
         optimizer.zero_grad()
         
+        mp_dataloader = pl.MpDeviceLoader(dataloader, device)
+
         for batch_idx, full_batch in enumerate(mp_dataloader):
             
             # --- A. Forward Pass ---
@@ -180,7 +181,7 @@ def main():
     os.environ.pop('CLOUD_TPU_TASK_ID', None)
     os.environ["PJRT_DEVICE"] = "TPU"
     
-    print("Launching PyTorch XLA training on Kaggle TPU...")
+    print("Launching PyTorch XLA training on TPU...")
     xmp.spawn(train_fn, nprocs=None, start_method='spawn')
 
 if __name__ == "__main__":

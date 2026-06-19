@@ -84,4 +84,4 @@ If we understand the working of the Iterative Latent Diffusion for KV Compressio
 
 ## **Note:** This is a research project. The code and training setup are experimental and subject to change.
 
-## Contributers are welcome!!!!
+## Contributors are welcome!!!!

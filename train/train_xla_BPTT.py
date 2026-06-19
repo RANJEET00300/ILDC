@@ -25,9 +25,8 @@ from torch_xla.distributed.spmd import Mesh
 import numpy as np
 
 """
-ILDC Stage 1 Warm-up Training — PyTorch XLA (TPU v5e-8)
+ILDC Stage 1 Training — PyTorch XLA (TPU v5e-8)
 =======================================================
-Policy Gradient (RL) Version
 """
 
 class TrainingConfig:
@@ -62,7 +61,6 @@ def train_fn(index):
     
     xm.master_print("=" * 60)
     xm.master_print("  ILDC Stage 1 Warm-up Training (PyTorch XLA / TPU)")
-    xm.master_print("  Mode: RL Policy Gradient (Zero AR Backprop)")
     xm.master_print(f"  World size: {world_size} TPU cores")
     xm.master_print("=" * 60)
     

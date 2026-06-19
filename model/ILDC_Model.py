@@ -572,7 +572,7 @@ class CompDiTModel(nn.Module):
         
         kv_caches: torch.Tensor of shape (
                                     B, num_hidden_layers, seq_len, 2, num_heads, head_dim
-                                ) [KVs from AR forward passes]
+                                ) [KVs from AR forward passes + Compressed KVs too]
         
         timestep: int [the step of diffusion]
         start_pos: int [Start-position of uncompressed KVs in KV-caches which we are going to compress]
@@ -652,7 +652,7 @@ def load_models(checkpoint_dir, device):
     print(f"Using device: {device}")
     print("Loading ILDC Architecture...")
 
-    checkpoint = f"{checkpoint_dir}/dc_model_final.pt"
+    checkpoint = checkpoint_dir
     
     model_id = "google/gemma-3-1b-it"
     # Instantiate models
@@ -691,11 +691,14 @@ def load_models(checkpoint_dir, device):
 
 
     del hf_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+
     print("Weights loaded successfully!")
 
-    return ar_model.to(device), dc_model.to(device)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return ar_model.to("cuda:0"), dc_model.to("cuda:1")
+    else:
+        return ar_model.to(device), dc_model.to(device)
 
 
 
@@ -796,10 +799,9 @@ class ILDC(nn.Module):
 
 
 
-
-    # =================================================================================================
-
-    def forward(
+    # ================================================================================================
+    # full-bptt forward....
+    def bptt_forward(
         self, input_ids, context_ids=None, 
         active_kv_caches= None, active_compressed_kv= None, 
         latent_states= None,
@@ -812,6 +814,7 @@ class ILDC(nn.Module):
         """
         X_factor = self.config.X_factor
         target_dtype = self.config.dtype
+        device = self.device
 
         # upcoming token for training
         B , future_len = input_ids.shape
@@ -907,8 +910,6 @@ class ILDC(nn.Module):
             T_compressed_kv_caches = T_newcompressed_kv_caches
 
         # =============================== Student ===========================================================
-
-        device = input_ids.device
         
         # Process the target tokens utilizing the compressed KVs for historical context
         # As the DM_Tower goes with diffusion steps, and we are conditions the LLM 
@@ -957,6 +958,7 @@ class ILDC(nn.Module):
 
 
         return train_output, T_latent_states
+
 
 
 
@@ -1100,7 +1102,202 @@ class ILDC(nn.Module):
 
 
 
+    def llm_teacher_pass(
+        self, input_ids, context_ids=None, 
+        active_kv_caches= None, active_compressed_kv= None
+        ):
 
+        """
+        LLM Teacher pass to forward inputs to LLM to produce logits and KV-caches
+        input_ids: the preceeding token which will be in native embedding 
+        context_ids: the preceeding token which will be compressed before feeding to AR
+        """
+        X_factor = self.config.X_factor
+        target_dtype = self.config.dtype
+        device = self.device
+
+        # upcoming token for training
+        B , future_len = input_ids.shape
+        current_ids = input_ids
+
+        # current preceeding token in context
+        current_len = 0
+        if context_ids is not None:
+            _, current_len = context_ids.shape
+            current_ids = torch.cat([context_ids, current_ids], dim=1)
+
+       
+        # effective seq-len to be compressed
+        eff_seq_len = current_len
+
+        if active_kv_caches is not None:
+            _, _, KV_len, _, _, _ = active_compressed_kv.shape
+            eff_seq_len += KV_len
+            dropped_kvs =  active_kv_caches
+
+        K_latent_len = (eff_seq_len + X_factor -1)// X_factor
+
+        # ===================================== Teacher ==============================================================
+         
+
+        
+        # 1. TEACHER PASS (No Gradients)
+        with torch.no_grad():
+            # Process the dropped context to populate its KV cache
+            teacher_outputs = self.ar_model(
+                input_ids = current_ids,   # combined input_ids + context_ids
+                active_kv_caches=active_kv_caches,
+                compressed_kv_caches=active_compressed_kv
+            )
+
+            # Teacher truth for the future tokens
+            teacher_hidden_states = teacher_outputs["hidden_states"]
+            teacher_output_logits = teacher_outputs["logits"]
+            teacher_active_kv_caches = teacher_outputs["active_kv_caches"]
+
+            # logit and hidden-states for future training
+            h_teacher = teacher_hidden_states[:, -int(future_len):, :] # [B, S, H]
+            logits_teacher = teacher_output_logits[:, -int(future_len):, :]       # [B, S, V]
+
+            # total uncompressed kvs, from input kV_caches and the new uncompressed context KVs to be compressed
+            uncomp_context_kvs = teacher_active_kv_caches[:, :, :int(eff_seq_len), ... ]
+            
+        return (input_ids, h_teacher, logits_teacher, uncomp_context_kvs, active_compressed_kv), K_latent_len  # full_active_pass
+
+
+    
+
+    # =================================================================================================
+    # Sifting from BPTT to single step block training implementation...
+    def forward(
+        self, input_ids=None, context_ids=None, active_kv_caches= None, active_compressed_kv= None, start_pos=0,
+        full_active_pass = None,   # if full kv cache exists, do not call teacher,...just compress and pass to student
+        start_step = 0, diff_steps=2, prev_ground_latent_states= None
+        ): 
+        """
+        full_active_pass: tuple (h_teacher, logits_teacher, uncomp_context_kvs)
+        diff_steps: T
+        """
+        device = self.device
+        target_dtype = self.config.dtype
+
+
+        if full_active_pass is None:
+            full_active_pass, K_latent_len = self.llm_teacher_pass(input_ids, context_ids, active_kv_caches, active_compressed_kv)
+        
+        input_ids, h_teacher, logits_teacher, uncomp_context_kvs, active_compressed_kv = full_active_pass
+
+        B, S = input_ids.shape
+        # ============================ KV Compression==============================================================
+
+        # Our start-pos for compression will start after the cmpressed kvs for efficient compression
+        # if both the compressed_kv and start-pos are given,...we assume is as mistake and overwrite the start-pos
+
+        if active_compressed_kv is not None:
+            _, _, CompKV_len, _, _, _ = active_compressed_kv.shape
+            if start_pos is not None:
+                print(f"Overwriting start-pos with Comp_KV seq len: {CompKV_len}!")
+            start_pos = CompKV_len
+            # Totals KVs on which to conditioned for compression: Compressed_KVs and Uncompressed KVs too!
+            cond_context_kvs = torch.cat([active_compressed_kv, uncomp_context_kvs], dim=2)
+        else: 
+            cond_context_kvs = uncomp_context_kvs
+
+
+
+        # Compress the extracted KVs using the DM tower 
+        if (start_step == 0) or (prev_ground_latent_states is None):
+             # if No latent_states, we assume, it is the first step and so we just put a noisy latent
+            # and also make start_step = 0
+            start_step = 0
+            prev_ground_latent_states = torch.randn(
+                B, 
+                K_latent_len, 
+                self.config.hidden_size, 
+                device=self.device, 
+                dtype=target_dtype
+            )
+            # as we have no ground state because we havn't trained for that...
+            current_ground_latent_states = prev_ground_latent_states
+
+        else:
+            with torch.no_grad():
+                T_latent_states, T_newcompressed_kv_caches = self.kv_compress(
+                    prev_ground_latent_states, 
+                    cond_context_kvs,
+                    start_step - diff_steps, # back_step. ground -> c_ground | diff_steps. c_ground -> current_train_step...
+                    diff_steps, 
+                    start_pos)
+
+                current_ground_latent_states = T_latent_states[:, -1, ...]
+                current_ground_latent_states = current_ground_latent_states.detach()
+
+
+        T_latent_states, T_newcompressed_kv_caches = self.kv_compress(
+            current_ground_latent_states, 
+            cond_context_kvs, 
+            start_step, # back_step. ground -> c_ground | diff_steps. c_ground -> current_train_step...
+            diff_steps,          
+            start_pos)
+
+            
+
+            
+        B, T, L, Comp_Seq, _, H, D = T_newcompressed_kv_caches.shape
+        newcompressed_kv_caches = T_newcompressed_kv_caches[:, -1, ...]
+        
+        # Concat new and previous compressed KVs
+        if active_compressed_kv is not None:
+            compressed_kv_caches = torch.cat([active_compressed_kv, newcompressed_kv_caches], dim=2)
+        else:
+            compressed_kv_caches = newcompressed_kv_caches
+
+        # =============================== Student ===========================================================
+
+        
+        student_outputs = self.ar_model(
+            input_ids = input_ids, 
+            active_kv_caches=None,  # As we have compressed all the KV caches
+            compressed_kv_caches=compressed_kv_caches
+        )
+        
+        # Shapes: [B, S, V] and [B, S, H]
+        logits_student = student_outputs["logits"] 
+        h_student = student_outputs["hidden_states"]
+
+
+        # ============================= Output =============================================================
+        
+        train_output = {
+            "teacher": {
+                "hidden": h_teacher,  #(B, S, V)
+                "logits": logits_teacher
+            },
+            "student":{
+                "hidden": h_student, #(B, S, V)
+                "logits": logits_student 
+            }
+        }
+
+
+        return train_output, full_active_pass, T_latent_states.detach(), current_ground_latent_states.detach()    #.detach()
+
+
+
+
+
+
+
+
+"""
+We are asking CompDiTModel to produce best latent vector which will act as query 
+which then going to look at the LLM KVs and produce best latent KVS as compressed KVS to be used by LLM for further autoregression;
+
+I doubt it!
+
+Instead; we should keep the prev. step latent KVs and tell the diffusion model to reason onto itself what he know and what he need to know more
+which will produce best KVs to act as compressed KVs...
+"""
 
 
 
@@ -1139,21 +1336,53 @@ class ILDC(nn.Module):
 #     print(A, B)
 
 
+# device = 'cuda'
 
+# ILDC_model = ILDC(device = device)
+# ILDC_model.to(torch.bfloat16)
 # with torch.no_grad():
+#     start_step = 0
+#     diff_steps = 2
+#     total_diff_steps = 8
 
-#     output = ILDC_model(
+#     train_output, full_active_pass, T_latent_states, prev_ground_latent_states = ILDC_model(
 #         input_ids = torch.randint(1, 26400, (3, 512)).to(device), 
 #         context_ids=torch.randint(1, 26400, (3, 2048)).to(device), 
-#         active_kv_caches= torch.randn(3, 26, 1024, 2, 1, 256).to(torch.bfloat16).to(device), 
-#         active_compressed_kv= torch.randn(3, 26, 768, 2, 1, 256).to(torch.bfloat16).to(device), 
-#         latent_states = torch.randn(3, 192, 1152).to(torch.bfloat16).to(device),
-#         start_step = 0, 
-#         diff_steps=1, 
-#         start_pos=768  # as we already have 768 compressed kvs
+#         # active_kv_caches= torch.randn(3, 26, 1024, 2, 1, 256).to(torch.bfloat16).to(device), 
+#         # active_compressed_kv= torch.randn(3, 26, 768, 2, 1, 256).to(torch.bfloat16).to(device), 
+#         # start_pos=768,  # as we already have 768 compressed kvs
+
+#         start_step = start_step, 
+#         diff_steps= diff_steps,
+
+#         full_active_pass = None,   # if full kv cache exists, do not call teacher,...just compress and pass to student
+#         prev_ground_latent_states = torch.randn(3, 192, 1152).to(torch.bfloat16).to(device)
 #     )
 
-#     print(output)
+#     # print(train_output)
+#     print("Full Active Pass:", full_active_pass)
+#     print("Proceeding with full_active_pass latent diffusion")
+    
+#     for _ in range((total_diff_steps//diff_steps -1)):
+#         start_step += diff_steps 
+
+#         train_output, full_active_pass, T_latent_states, prev_ground_latent_states = ILDC_model(
+#             # input_ids = torch.randint(1, 26400, (3, 512)).to(device), 
+#             # context_ids=torch.randint(1, 26400, (3, 2048)).to(device), 
+#             # active_kv_caches= torch.randn(3, 26, 1024, 2, 1, 256).to(torch.bfloat16).to(device), 
+#             # active_compressed_kv= torch.randn(3, 26, 768, 2, 1, 256).to(torch.bfloat16).to(device), 
+#             # start_pos=768,  # as we already have 768 compressed kvs
+
+#             start_step = start_step, 
+#             diff_steps= diff_steps,
+
+#             full_active_pass = full_active_pass,   # if full kv cache exists, do not call teacher,...just compress and pass to student
+#             prev_ground_latent_states = prev_ground_latent_states
+#         )
+
+#         print(train_output)
+
+
 
 
 # hidden_fact = "The secret code to bypass the mainframe is 'OMEGA-77'."

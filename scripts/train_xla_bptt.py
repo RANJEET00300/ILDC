@@ -1,20 +1,26 @@
-# =========================================================================
+# ===================================================================================
 
 
 import os
-import sys
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from transformers import get_cosine_schedule_with_warmup
-from transformers import AutoModelForCausalLM
 
-from model.ILDC_Model import ILDC
-from train.Train_Step import train_step
-from dataset.data_loader import get_wikipedia_batches
 
-import numpy as np
+from ildc.models.ildc_model import ILDC
+from ildc.trainer.train_step_bptt import train_step
+from ildc.data.data_loader import get_wikipedia_batches
 
+
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.distributed.parallel_loader as pl
+
+"""
+ILDC Training — PyTorch XLA
+=======================================================
+"""
 
 
 class TrainingConfig:
@@ -22,61 +28,63 @@ class TrainingConfig:
         self.model_id = "google/gemma-3-1b-it"
         self.dataset_name = "wikimedia/wikipedia"
         self.dataset_config = "20241101.en"
-        self.past_len = 2048    
-        self.future_len = 512   
+        self.past_len = 2048
+        self.future_len = 512
         self.full_len = 2561
-        self.batch_size = 1     
+        self.batch_size = 1
         self.gradient_accumulation_steps = 32
         self.learning_rate = 1e-4
         self.epochs = 10
-        self.checkpoint_dir = "kaggle/working/checkpoints/dc_model_step_100.pt"
-        self.log_every = 1      
-        self.save_every = 100   
+        self.checkpoint_dir = "./checkpoints/dc_model_step_100.pt"
+        self.log_every = 1
+        self.save_every = 100
         self.lambda_latent = 0.1
-        self.lambda_refine = 9.0
-        self.diffusion_steps = 2 # hard training with BPTT
+        self.diffusion_steps = 8
         self.N_batches = 16384
 
 
-        
 def train_fn(index):
     config = TrainingConfig()
-    chunk_size = config.past_len + config.future_len + 1
-    
-    device = torch.device("cuda")
-    world_size = torch.cuda.device_count()
-    rank = 0
-    
-    
+    config.past_len + config.future_len + 1
+
+    device = torch_xla.device()
+    world_size = xr.world_size()
+    rank = xr.global_ordinal()
+
+    xm.master_print("=" * 60)
+    xm.master_print("  ILDC Stage 1 Warm-up Training (PyTorch XLA / TPU)")
+    xm.master_print(f"  World size: {world_size} TPU cores")
+    xm.master_print("=" * 60)
+
     dataloader = get_wikipedia_batches(
-        tokenizer_path=config.model_id, 
-        batch_size=config.batch_size, 
-        required_length=config.full_len, 
-        max_batches= config.N_batches  
+        tokenizer_path=config.model_id,
+        batch_size=config.batch_size,
+        required_length=config.full_len,
+        max_batches=config.N_batches,
     )
-    mp_dataloader = dataloader
-    
-    print("Loading ILDC Model...")
+    # mp_dataloader = pl.MpDeviceLoader(dataloader, device)
+
+    xm.master_print("Loading ILDC Model...")
     ILDC_model = ILDC(config.checkpoint_dir, device)
     ILDC_model.to(torch.bfloat16)
     ILDC_model.to(device)
 
+    ILDC_model.dc_model.train()
+    optimizer = torch.optim.AdamW(
+        [{"params": ILDC_model.dc_model.parameters(), "lr": 1e-4, "weight_decay": 0.01}]
+    )
 
-    ILDC_model.dc_model.train()  
-    optimizer = torch.optim.AdamW([{'params': ILDC_model.dc_model.parameters(), 'lr': 1e-4, 'weight_decay': 0.01}])
-    
-    if rank == 0: os.makedirs(config.checkpoint_dir, exist_ok=True)
+    if rank == 0:
+        os.makedirs(config.checkpoint_dir, exist_ok=True)
     # ==============================================================================
     # 2. SCHEDULER SETUP (COSINE + WARMUP)
     # ==============================================================================
-    grad_accum_steps = config.gradient_accumulation_steps # e.g., 16 or 32
+    grad_accum_steps = config.gradient_accumulation_steps  # e.g., 16 or 32
     total_optim_steps = (config.N_batches // grad_accum_steps) * config.epochs
-    warmup_steps = int(total_optim_steps * 0.05) # 5% of training is warmup
+    warmup_steps = int(total_optim_steps * 0.05)  # 5% of training is warmup
 
     scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_optim_steps
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_optim_steps
     )
 
     # ==============================================================================
@@ -88,23 +96,23 @@ def train_fn(index):
     running_mse = 0.0
 
     # ==============================================================================
-    # 4. THE CUDA TRAINING LOOP
+    # 4. THE XLA TRAINING LOOP
     # ==============================================================================
-    print(f"Starting Training! Total Opt Steps: {total_optim_steps} | Warmup: {warmup_steps}")
+    xm.master_print(
+        f"Starting Training! Total Opt Steps: {total_optim_steps} | Warmup: {warmup_steps}"
+    )
 
     for epoch in range(config.epochs):
         optimizer.zero_grad()
-        
+
+        mp_dataloader = pl.MpDeviceLoader(dataloader, device)
+
         for batch_idx, full_batch in enumerate(mp_dataloader):
-            
             # --- A. Forward Pass ---
             train_loss, loss_items = train_step(
-                ILDC_model, full_batch["input_ids"], 
-                config.past_len, 
-                config.diffusion_steps, 
-                config
+                ILDC_model, full_batch["input_ids"], config.past_len, config.diffusion_steps, config
             )
-            
+
             # --- B. Gradient Accumulation Scaling ---
             # We divide the loss so the accumulated gradients equal a true large batch
             loss_to_backward = train_loss / grad_accum_steps
@@ -117,34 +125,33 @@ def train_fn(index):
 
             # --- C. Optimization Step (Only every 'grad_accum_steps') ---
             if (batch_idx + 1) % grad_accum_steps == 0:
-                
                 # 1. Gradient Clipping
                 torch.nn.utils.clip_grad_norm_(ILDC_model.parameters(), max_norm=1.0)
-                
-                # 2. CUDA Optimizer Step 
-                optimizer.step()
-                
+
+                # 2. XLA Optimizer Step
+                xm.optimizer_step(optimizer)
+
                 # 3. Scheduler Step & Zero Grad
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
-                
+
                 # --- D. Observability & Logging ---
                 if global_step % config.log_every == 0:
                     # Average the metrics over the logging window
                     avg_loss = running_loss / (config.log_every * grad_accum_steps)
-                    avg_log  = running_logit / (config.log_every * grad_accum_steps)
-                    avg_mse  = running_mse / (config.log_every * grad_accum_steps)
-                    
-                    current_dm_lr = optimizer.param_groups[0]['lr']
+                    avg_log = running_logit / (config.log_every * grad_accum_steps)
+                    avg_mse = running_mse / (config.log_every * grad_accum_steps)
 
-                    print(
+                    current_dm_lr = optimizer.param_groups[0]["lr"]
+
+                    xm.master_print(
                         f"Epoch {epoch} | Step {global_step}/{total_optim_steps} | "
                         f"Loss: {avg_loss.item():.4f} "
                         f"(Logit: {avg_log:.4f}, MSE: {avg_mse:.4f}) | "
                         f"LR_DM: {current_dm_lr:.2e}"
                     )
-                    
+
                     # Reset trackers
                     running_loss = 0.0
                     running_logit = 0.0
@@ -152,16 +159,26 @@ def train_fn(index):
 
                 # --- E. Saving Checkpoints ---
                 if global_step > 0 and global_step % config.save_every == 0:
-                    checkpoint_path = os.path.join(config.checkpoint_dir, f"dc_model_step_{global_step}.pt")
-                    torch.save(ILDC_model.dc_model.state_dict(), checkpoint_path)
-                    print(f"--> Saved Checkpoint to {checkpoint_path}")
+                    checkpoint_path = os.path.join(
+                        config.checkpoint_dir, f"dc_model_step_{global_step}.pt"
+                    )
+                    xm.save(ILDC_model.dc_model.state_dict(), checkpoint_path)
+                    xm.master_print(f"--> Saved Checkpoint to {checkpoint_path}")
 
-    print("Training complete!")
-    torch.save(ILDC_model.dc_model.state_dict(), os.path.join(config.checkpoint_dir, "dc_model_final.pt"))
+    xm.master_print("Training complete!")
+    xm.save(
+        ILDC_model.dc_model.state_dict(), os.path.join(config.checkpoint_dir, "dc_model_final.pt")
+    )
+
 
 def main():
-    train_fn()
+    os.environ.pop("TPU_PROCESS_ADDRESSES", None)
+    os.environ.pop("CLOUD_TPU_TASK_ID", None)
+    os.environ["PJRT_DEVICE"] = "TPU"
+
+    print("Launching PyTorch XLA training on TPU...")
+    xmp.spawn(train_fn, nprocs=None, start_method="spawn")
+
 
 if __name__ == "__main__":
     main()
-

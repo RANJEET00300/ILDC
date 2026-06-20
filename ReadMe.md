@@ -5,14 +5,14 @@
 ---
 
 ## The Idea:
-   Shift KV Cache compression from *discrete token pruning* (dropping words) to *generative latent representation*. 
+   Shift KV Cache compression from *discrete token pruning* (dropping words) to *generative latent representation*.
 Instead of a massive $N$-length context window, use a Diffusion block to iteratively denoise a dynamic set of $K$ tokens (where $K = N / X\\_factor$) conditioned on the $N$ context tokens. The result is a hyper-dense, continuous "thought vector" that perfectly represents the semantic structure of the dropped context, yielding massive memory efficiency.
 
 
 ## The Final Architecture Blueprint (How it works)
 
 1.  **The Active Process:** The pre-trained LLM processes incoming text using a standard Attention (e.g., 8k tokens).
-2.  **The Background Compression:** The Diffusion Model(Self-attention for latent-kvs and cross-attention with input LLM KVs) takes these $N$ dropped hidden states and iteratively compresses them down into $K$ continuous tokens (where $K = N / X\\_factor$). 
+2.  **The Background Compression:** The Diffusion Model(Self-attention for latent-kvs and cross-attention with input LLM KVs) takes these $N$ dropped hidden states and iteratively compresses them down into $K$ continuous tokens (where $K = N / X\\_factor$).
 3.  **The Generation with COmpressed KVS:** Now the LLM can use the $K$ compressed KVs to predict the next token.
 4. **Temporal Anchoring Strided RoPE:** The LLM can understand the timeline of these $K$ compressed KVs we got from the DM compressor as during diffusion, we are anchoring the latent-kvs with the stride rope embedding.
 ---
@@ -72,14 +72,14 @@ If we understand the working of the Iterative Latent Diffusion for KV Compressio
     * Lower layers (close to input) can use higher compression ratios (e.g., O(sqrt(n)) or O(log(n)))
     * Higher layers (close to output) can use lower compression ratios (e.g., O(1))
 2. **Progressive Refinement**: Multiple passes of compression with increasing fidelity.
-3. **Adaptive Compression**: Compression ratio adjusts dynamically based on context complexity. 
+3. **Adaptive Compression**: Compression ratio adjusts dynamically based on context complexity.
 
 ---
 **Best Use Case:**
 1. **Continuous Learning & Evolving AI Systems:** Models can continuously learn from their environment and adapt their behavior over time with the compression model's self reflection on the long term layered context and use that memory to make better decisions in the future...
 2. **Robotic AI Embodiement:** Live Models with high frequecy sensor data and vision + audio + text inputs for real time decision making and actions...
 3. **Real-time Multimodal AI Assistant:** Live Models with vision + audio + text inputs for real time assistance...
-    
+
 ---
 
 ## **Note:** This is a research project. The code and training setup are experimental and subject to change.

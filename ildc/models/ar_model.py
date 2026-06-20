@@ -8,8 +8,15 @@ from .helper_fn import RMSNorm, apply_rotary_pos_emb
 from .config import ModelConfig
 
 
-# MLP: will be used in both AR and DC
 class MLP(nn.Module):
+    """
+    Multi-Layer Perceptron (MLP) with Gated-GELU activation.
+
+    Used in both the Auto-Regressive (AR) and Diffusion Compressor (DC) models.
+    Maps hidden states to an intermediate size, applies a gating mechanism
+    using GELU, and projects back to the hidden size.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -20,8 +27,15 @@ class MLP(nn.Module):
         return self.down_proj(F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
 
 
-# Grouped Query Multihead Attention:
 class GQMHAttention_AR(nn.Module):
+    """
+    Grouped Query Multi-Head Attention (GQMHAttention) tailored for ILDC.
+
+    This modified attention mechanism seamlessly concatenates historical
+    uncompressed KV caches and compressed latent KV caches (from the DiT tower)
+    ahead of the current sequence's KV cache.
+    """
+
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
@@ -40,19 +54,35 @@ class GQMHAttention_AR(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
-        self, hidden_states, position_ids, attention_mask=None, active_kv=None, compressed_kv=None
-    ):
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        active_kv: torch.Tensor = None,
+        compressed_kv: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        hidden_states: torch.Tensor of shape (batch_size, seq_len, hidden_size)
-                    [Tokens to be processed]
+        Forward pass for Grouped Query Attention.
 
-        active_kv: torch.Tensor of shape (
-                                    B, active_kv_len, 2, num_kv_heads, head_dim
-                                ) [KVs from previous forward passes]
+        Args:
+            hidden_states (torch.Tensor): Shape (B, seq_len, hidden_size). Tokens to process.
+            position_ids (torch.Tensor): Shape (B, seq_len). Sequence positions for RoPE.
+            attention_mask (torch.Tensor, optional): Shape (1, 1, seq_len, total_kv_len).
+                                                    Causal mask.
+            active_kv (torch.Tensor, optional):
+                Shape (B, active_kv_len, 2, num_kv_heads, head_dim).
+                Uncompressed KV cache from previous forward passes.
 
-        compressed_kv: torch.tensor of shape (
-                                    B, K_hidden_len, 2, num_kv_heads, head_dim
-                                ) from DiT Tower (compressed)
+            compressed_kv (torch.Tensor, optional):
+                Shape (B, K_hidden_len, 2, num_kv_heads, head_dim).
+                Compressed latent KV cache from the Diffusion tower.
+
+        Returns:
+            Tuple of:
+                - attn_output (torch.Tensor): Shape (B, seq_len, hidden_size).
+                                            Projected attention outputs.
+                - new_kv (torch.Tensor): Shape (B, seq_len, 2, num_kv_heads, head_dim).
+                                            Current tokens' KV to be cached.
         """
 
         B, q_len, _ = hidden_states.shape
@@ -88,9 +118,22 @@ class GQMHAttention_AR(nn.Module):
             full_k = torch.cat([comp_k, full_k], dim=2)
             full_v = torch.cat([comp_v, full_v], dim=2)
 
-        # Repeat K/V for Grouped Query Attention
-        full_k = full_k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-        full_v = full_v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+        num_queries_per_kv = self.num_heads // self.num_kv_heads
+
+        # Shape goes from (B, num_kv_heads, total_seq_len, head_dim)
+        # -> (B, num_kv_heads, num_queries_per_kv, total_seq_len, head_dim)
+        # -> (B, num_heads, total_seq_len, head_dim)
+        full_k = (
+            full_k.unsqueeze(2)
+            .expand(-1, -1, num_queries_per_kv, -1, -1)
+            .reshape(B, self.num_heads, full_k.size(2), self.head_dim)
+        )
+
+        full_v = (
+            full_v.unsqueeze(2)
+            .expand(-1, -1, num_queries_per_kv, -1, -1)
+            .reshape(B, self.num_heads, full_v.size(2), self.head_dim)
+        )
 
         attn_output = F.scaled_dot_product_attention(q, full_k, full_v, attn_mask=attention_mask)
 
@@ -99,6 +142,13 @@ class GQMHAttention_AR(nn.Module):
 
 
 class LLM_block(nn.Module):
+    """
+    Standard Auto-Regressive Transformer Block.
+
+    Contains pre-norm GQMHAttention and pre-norm MLP layers.
+    Routes active and compressed KV caches specifically to the attention module.
+    """
+
     def __init__(self, config, layer_idx):
         super().__init__()
         self.self_attn = GQMHAttention_AR(config, layer_idx)
@@ -127,12 +177,14 @@ class LLM_block(nn.Module):
         return hidden_states, new_kv
 
 
-#
-
-#
-
-
 class CausalLM(nn.Module):
+    """
+    Auto-Regressive (AR) Language Model.
+
+    This acts as both the Teacher (generating uncompressed context targets)
+    and the Student (generating future tokens conditioned on compressed latents).
+    """
+
     def __init__(self):
         super().__init__()
         self.config = ModelConfig()
@@ -147,18 +199,29 @@ class CausalLM(nn.Module):
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
 
-    def forward(self, input_ids, active_kv_caches=None, compressed_kv_caches=None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        active_kv_caches: torch.Tensor = None,
+        compressed_kv_caches: torch.Tensor = None,
+    ) -> dict:
         """
-        input_ids: torch.Tensor of shape (batch_size, seq_len)
-                    [Tokens to be processed]
+        Forward pass for the Causal LM.
 
-        active_kv_caches: torch.Tensor of shape (
-                                    B, num_layer, active_kv_len, 2, num_kv_heads, head_dim
-                                ) [KVs from previous forward passes] if not compressed
+        Args:
+            input_ids (torch.Tensor): Shape (B, seq_len). Input token IDs.
+            active_kv_caches (torch.Tensor, optional): Shape
+                (B, num_layer, active_kv_len, 2, num_kv_heads, head_dim).
+                Uncompressed KV cache from previous steps.
+            compressed_kv_caches (torch.Tensor, optional): Shape
+                (B, num_layer, K_hidden_state, 2, num_kv_heads, head_dim).
+                Compressed KV cache from the DiT Tower.
 
-        compressed_kv_caches: torch.tensor of shape (
-                                    B, num_layer, K_hidden_state, 2, num_kv_heads, head_dim
-                                ) from DiT Tower
+        Returns:
+            dict containing:
+                - 'logits': Output predictions over the vocabulary.
+                - 'hidden_states': Final transformer hidden states.
+                - 'active_kv_caches': The newly constructed active KV cache.
         """
 
         B, seq_len = input_ids.shape

@@ -17,7 +17,21 @@ Modified to support ILDC (Iterative Latent Diffusion for Continuous KV Compressi
 """
 
 
-def load_models(checkpoint_dir, device):
+def load_models(checkpoint_dir: str, device: str) -> tuple[nn.Module, nn.Module]:
+    """
+    Instantiates the AR and DC models and maps weights from Gemma.
+
+    Downloads the base Gemma-3-1B-it weights, strips the prefix, and loads
+    them into the AR model. It also copies the Gemma MLP weights into the
+    Diffusion Compressor (DC) model to provide a strong linguistic prior.
+
+    Args:
+        checkpoint_dir (str): Path to trained DC weights, if available.
+        device (str): Device to place the models on.
+
+    Returns:
+        Tuple of (ar_model, dc_model).
+    """
     print(f"Using device: {device}")
     print("Loading ILDC Architecture...")
 
@@ -99,22 +113,34 @@ class ILDC(nn.Module):
     # Latent KV Compression Model
 
     def kv_compress(
-        self, latent_states, latent_kvs, kv_caches, start_step, diff_steps: int = 1, start_pos=0
-    ):
+        self,
+        latent_states: torch.Tensor,
+        latent_kvs: torch.Tensor,
+        kv_caches: torch.Tensor,
+        start_step: int,
+        diff_steps: int = 1,
+        start_pos: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        [Diffusion Latent States]
-        latent_states: torch.tensor of shape (B, K_latent, latent_size)
+        Iteratively compresses LLM KV caches using the Diffusion Model.
 
-        kv_caches: torch.Tensor of shape (
-                                    B, num_hidden_layers, seq_len, 2, num_heads, head_dim
-                                ) [KVs Compressed and Uncompressed Both]
+        Args:
+            latent_states (torch.Tensor):
+                Shape (B, K_latent, latent_size). Initial noisy latents.
+            latent_kvs (torch.Tensor):
+                Shape (B, layers, K_latent, 2, heads, head_dim). Prior step latent KVs.
+            kv_caches (torch.Tensor):
+                Shape (B, layers, seq_len, 2, heads, head_dim). Target LLM KVs.
+            start_step (int): Starting timestep for diffusion.
+            diff_steps (int): Number of denoising steps to run.
+            start_pos (int): Strided RoPE positional anchor.
 
-        start_step: int [the timestep of input Latent-step if has been processed]
-        diff_steps: int [Diffusion steps to go]
-        start_pos: int [Start-position of uncompressed KVs in KV-caches which we are going
-                        to compress]
-
-        Return: Latent States & New compressed KVs
+        Returns:
+            Tuple of:
+                - output_state: Shape (Steps, B, K_latent, latent_size). Latents at each step.
+                - output_compressed_kvs:
+                    Shape (Steps, B, layers, K_latent, 2, heads, head_dim).
+                    Compressed KVs at each step.
         """
 
         B, num_layer, seq_len, _, num_heads, H = kv_caches.shape
@@ -167,19 +193,28 @@ class ILDC(nn.Module):
     # full-bptt forward....
     def bptt_forward(
         self,
-        input_ids,
-        context_ids=None,
-        active_kv_caches=None,
-        active_compressed_kv=None,
-        latent_states=None,
-        start_step=0,
-        diff_steps=1,
-        start_pos=None,
-    ):
+        input_ids: torch.Tensor,
+        context_ids: torch.Tensor = None,
+        active_kv_caches: torch.Tensor = None,
+        active_compressed_kv: torch.Tensor = None,
+        latent_states: torch.Tensor = None,
+        start_step: int = 0,
+        diff_steps: int = 1,
+        start_pos: int = None,
+    ) -> tuple[dict, torch.Tensor]:
         """
-        Forward pass mainly used for Student Pass during training.
-        input_ids: the preceeding token which will be in native embedding
-        context_ids: the preceeding token which will be compressed before feeding to AR
+        Full Back-Propagation Through Time (BPTT) Forward Pass.
+
+        Performs the Latent Knowledge Distillation (LKD) workflow:
+        1. Teacher Pass: Runs AR model on uncompressed context to get target
+        logits/hidden states.
+        2. KV Compression: Compresses the dropped context into latent KVs.
+        3. Student Pass: Runs AR model conditioned *only* on compressed KVs.
+
+        Returns:
+            Tuple containing:
+                - dict of teacher vs student logits and hidden states.
+                - The raw diffusion latent states for further steps.
         """
         X_factor = self.config.X_factor
         target_dtype = self.config.dtype
@@ -320,16 +355,20 @@ class ILDC(nn.Module):
     # Sifting from BPTT to single step block training implementation...
     def forward(
         self,
-        input_ids=None,
-        context_ids=None,
-        active_kv_caches=None,
-        active_compressed_kv=None,
-        start_pos=0,
-        start_step=0,
-        diff_steps=2,
-    ):
+        input_ids: torch.Tensor = None,
+        context_ids: torch.Tensor = None,
+        active_kv_caches: torch.Tensor = None,
+        active_compressed_kv: torch.Tensor = None,
+        start_pos: int = 0,
+        start_step: int = 0,
+        diff_steps: int = 2,
+    ) -> tuple[dict, torch.Tensor]:
         """
-        diff_steps: T
+        Single-step block training Forward Pass (Memory Optimized).
+
+        Trades compute for memory by decoupling the sequential BPTT steps into isolated
+        blocks. Extracts the target distribution from the Teacher and aligns the
+        Student's generation conditioned on the compressed history.
         """
         target_dtype = self.config.dtype
 
@@ -614,77 +653,3 @@ to act as compressed KVs...
 
 Just Implemented...
 """
-
-
-# device = 'cpu'
-
-
-# ILDC_model = ILDC(device = device)
-# ILDC_model.to(torch.bfloat16)
-
-# AR_model = ILDC_model.ar_model
-
-# with torch.no_grad():
-#     # [B, Seq_len]
-#     # input_ids = None
-#     input_ids = torch.randint(1, 26400, (1, 16))
-
-#     # [B, Layers, Seq_len, KV, heads, Head_dim]
-#     active_kv_caches = None
-#     # active_kv_caches = torch.randn(1, 26, 1024, 2, 1, 256).to(torch.bfloat16)
-
-#     # compressed_kv_caches = None
-#     compressed_kv_caches = torch.randn(1, 26, 15, 2, 1, 256).to(torch.bfloat16)
-#     outputs = AR_model(input_ids, active_kv_caches, compressed_kv_caches)
-#     print(outputs["hidden_states"].shape)
-#     print(outputs["active_kv_caches"].shape)
-
-
-# DC_model = CompDiTModel().to(torch.bfloat16)
-
-# with torch.no_grad():
-#     # [B, Layers, Seq_len, KV, heads, Head_dim]
-#     kv_caches = torch.randn(3, 26, 1024, 2, 1, 256).to(torch.bfloat16)
-#     latent_states = torch.randn(3, 64, 1152).to(torch.bfloat16)
-#     A, B = DC_model(latent_states, kv_caches, 1)
-#     print(A, B)
-
-
-# device = 'cuda'
-
-# ILDC_model = ILDC(device = device)
-# ILDC_model.to(torch.bfloat16)
-# with torch.no_grad():
-#     start_step = 0
-#     diff_steps = 2
-#     total_diff_steps = 8
-
-#     for _ in range((total_diff_steps//diff_steps -1)):
-
-#         train_output = ILDC_model(
-#             input_ids = torch.randint(1, 26400, (3, 512)).to(device),
-#             context_ids=torch.randint(1, 26400, (3, 2048)).to(device),
-#             # active_kv_caches= torch.randn(
-#                  3, 26, 1024, 2, 1, 256
-#               ).to(torch.bfloat16).to(device),
-#             # active_compressed_kv= torch.randn(
-#                   3, 26, 768, 2, 1, 256
-#               ).to(torch.bfloat16).to(device),
-#             # start_pos=768,  # as we already have 768 compressed kvs
-
-#             start_step = start_step,
-#             diff_steps= diff_steps,
-#         )
-#         start_step += diff_steps
-
-#         print(train_output)
-
-
-# hidden_fact = "The secret code to bypass the mainframe is 'OMEGA-77'."
-# filler_text = """The system logs show normal operational status with minor fluctuations
-# in the thermal array. """ * 100
-
-# question = "What's the secret code of the mainframe? Hello"
-# prompt = filler_text + hidden_fact + filler_text
-
-# ILDC_model.generate_text(prompt)

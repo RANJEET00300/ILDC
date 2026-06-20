@@ -16,15 +16,14 @@ class ModelConfig:
         self.rope_local_base_freq = 10000
         self.window_size = 8192  # SWA Window Size
         self.X_factor = 16  # Compression ratio for Strided RoPE
-        self.latent_len = 256  # 2048 //16 compressed
 
 
 class TrainingConfig:
     def __init__(self):
         self.model_id = "google/gemma-3-1b-it"
-        self.dataset_name = "wikitext"
-        self.dataset_config = "wikitext-2-raw-v1"
-        self.checkpoint_dir = "./checkpoints/dc_model_final.pt"
+        self.dataset_name = "wikimedia/wikipedia"
+        self.dataset_config = "20241101.en"
+        self.checkpoint_dir = "./checkpoints"
 
         self.past_len = 2048
         self.future_len = 512
@@ -33,13 +32,13 @@ class TrainingConfig:
         self.learning_rate = 1e-4
         self.lambda_latent = 0.1
 
-        self.epochs = 10
         self.log_every = 1
         self.save_every = 100
 
         self.batch_size = 1
-        self.gradient_accumulation_steps = 16
-        self.total_diffusion_steps = 2
+        self.gradient_accumulation_steps = 32
+        self.total_diffusion_steps = 8
         self.diff_steps = 2  # hard training with Block, 2 steps per/
 
-        self.N_batches = 16384
+        self.N_batches = 16284
+        self.epochs = self.total_diffusion_steps - self.diff_steps + 1

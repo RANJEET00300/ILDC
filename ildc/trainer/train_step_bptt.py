@@ -8,15 +8,33 @@ import torch.nn.functional as F
 
 # ============================================================================
 # Latent Knowledge Distillation
-def train_step(ILDC_model, full_batch, past_len, diff_steps=1, config=None):
+def train_step(
+    ILDC_model: torch.nn.Module,
+    full_batch: torch.Tensor,
+    past_len: int,
+    diff_steps: int = 1,
+    config=None,
+) -> tuple[torch.Tensor, dict]:
     """
-    Executes the forward passes for Student-Teacher LKD.
-    Returns the loss tensor to be backpropagated by the external training loop.
+    Executes the Full Back-Propagation Through Time (BPTT) LKD forward pass.
+
+    Runs the Diffusion Compressor for multiple continuous steps within the graph.
+    Applies the Bayesian Step Schedule and Dynamic Morphing Target Distribution
+    across the entire temporal dimension simultaneously.
+
+    Args:
+        ILDC_model: The wrapper model containing AR and DC architectures.
+        full_batch (torch.Tensor): Shape (B, Total_S). The full sequence of tokens.
+        past_len (int): Length of the context to be compressed.
+        diff_steps (int): Total diffusion steps to unroll.
+        config: TrainingConfig object.
+
+    Returns:
+        Tuple of (total_loss_tensor, loss_items_dictionary).
     """
 
     device = full_batch.device
     B, Total_S = full_batch.shape
-    Total_S - past_len - 1
 
     context_tokens = full_batch[:, :past_len]
 
@@ -86,6 +104,7 @@ def train_step(ILDC_model, full_batch, past_len, diff_steps=1, config=None):
     # At t=0 (progress=0), target is 100% Smoothed Teacher.
     # At t=T (progress=1), target is 100% Hard Ground Truth.
     P_target = (1.0 - progress) * P_teacher + progress * P_labels
+    P_target = P_target.clamp(min=0.0, max=1.0)
 
     # ---------------------------------------------------------
     # 3. UNIFIED LOGIT LOSS
@@ -128,40 +147,3 @@ def train_step(ILDC_model, full_batch, past_len, diff_steps=1, config=None):
         # "refine_val": improvement_loss.item()
     }
     return total_loss, loss_items
-
-
-# class TrainingConfig:
-#     def __init__(self):
-#         self.model_id = "google/gemma-3-1b-it"
-#         self.dataset_name = "wikitext"
-#         self.dataset_config = "wikitext-2-raw-v1"
-#         self.past_len = 2048
-#         self.future_len = 512
-#         self.batch_size = 2
-#         self.gradient_accumulation_steps = 1
-#         self.learning_rate = 1e-5
-#         self.epochs = 10
-#         self.checkpoint_dir = "checkpoints"
-#         self.log_every = 1
-#         self.save_every = 100
-#         self.lambda_latent = 0.4
-#         self.lambda_refine = 9.0
-#         self.diff_steps = 2
-
-# train_config = TrainingConfig()
-
-# from ILDC_Model import ILDC
-# import os
-# import sys
-
-# device = "cpu"
-# ILDC_model = ILDC(device = device)
-# ILDC_model.to(torch.bfloat16)
-# ILDC_model.to(device)
-
-# with torch.no_grad():
-#     full_batch = torch.randint(1, 26400, (3, 2561)).to(device)
-#     past_len =  2048
-#     train_loss, loss_items = train_step(ILDC_model, full_batch, past_len, 2, train_config)
-#     print("Total Loss:", train_loss)
-#     print("Loss Items:", loss_items)

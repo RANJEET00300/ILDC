@@ -8,12 +8,27 @@ from .config import ModelConfig
 from .ar_model import MLP
 
 
-def modulate(x, shift, scale):
-    """Applies adaptive LayerNorm modulation."""
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """
+    Applies Adaptive LayerNorm (adaLN) modulation.
+
+    Dynamically scales and shifts the normalized hidden states
+    based on the current diffusion timestep condition.
+    """
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 class DiT_Block(nn.Module):
+    """
+    Diffusion Transformer Block.
+
+    Contains two novel attention mechanisms:
+    1. Dual Cross-Attention (daGPAM): Attends to LLM KV caches using positive/negative
+       queries and a bounded learnable skew (S).
+    2. Cog Self-Attention: Latents attend to each other using sign * softmax(|scores|)
+       to allow negative spatial correlations.
+    """
+
     def __init__(self, config, layer_idx):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -76,14 +91,28 @@ class DiT_Block(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
-    def forward(self, hidden_states, latent_kv, Cond_Vector, position_ids, kv_cache):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        latent_kv: torch.Tensor,
+        Cond_Vector: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        hidden_states: torch.Tensor of shape (batch_size, seq_len, hidden_size)
-                    [Latent Tokens]
+        Forward pass for a single Diffusion step in the DiT tower.
 
-        kv_cache: torch.Tensor of shape (
-                                    B, active_kv_len, 2, num_heads, head_dim
-                                ) [KVs from prior AR forward passes + Compressed KVs too]
+        Args:
+            hidden_states (torch.Tensor): Shape (B, seq_len, hidden_size). The noisy latents.
+            latent_kv (torch.Tensor): Shape (B, prev_latent_len, 2, num_kv_heads, head_dim).
+                Self-Attention KV cache of the latents.
+            Cond_Vector (torch.Tensor): Shape (B, hidden_size). Timestep conditioning vector.
+            position_ids (torch.Tensor): Shape (1, seq_len). Strided positions for the latents.
+            kv_cache (torch.Tensor): Shape (B, active_kv_len, 2, num_kv_heads, head_dim).
+                Uncompressed LLM KV cache to compress.
+
+        Returns:
+            Tuple of updated hidden_states and the generated latent_kv.
         """
 
         bsz, q_len, _ = hidden_states.size()
@@ -126,9 +155,18 @@ class DiT_Block(nn.Module):
         cond_k, cond_v = kv_cache[:, :, 0, ...], kv_cache[:, :, 1, ...]
         cond_k, cond_v = cond_k.transpose(1, 2), cond_v.transpose(1, 2)
 
-        # Repeat cond_kv to match DiT heads
-        cond_k = cond_k.repeat_interleave(self.num_heads // cond_k.shape[1], dim=1)
-        cond_v = cond_v.repeat_interleave(self.num_heads // cond_v.shape[1], dim=1)
+        num_queries_per_kv_cross = self.num_heads // cond_k.shape[1]
+        cond_k = (
+            cond_k.unsqueeze(2)
+            .expand(-1, -1, num_queries_per_kv_cross, -1, -1)
+            .reshape(bsz, self.num_heads, cond_k.size(2), self.head_dim)
+        )
+
+        cond_v = (
+            cond_v.unsqueeze(2)
+            .expand(-1, -1, num_queries_per_kv_cross, -1, -1)
+            .reshape(bsz, self.num_heads, cond_v.size(2), self.head_dim)
+        )
 
         # here we implement the daGPAM cross-Attention:
 
@@ -185,9 +223,18 @@ class DiT_Block(nn.Module):
         v_self = torch.cat([prev_v_self, v_self], dim=2)
 
         # Self-Attention (Spatial structure)
-        # Expand K/V for GQA
-        k_self = k_self.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-        v_self = v_self.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+        num_queries_per_kv_self = self.num_heads // self.num_kv_heads
+        k_self = (
+            k_self.unsqueeze(2)
+            .expand(-1, -1, num_queries_per_kv_self, -1, -1)
+            .reshape(bsz, self.num_heads, k_self.size(2), self.head_dim)
+        )
+
+        v_self = (
+            v_self.unsqueeze(2)
+            .expand(-1, -1, num_queries_per_kv_self, -1, -1)
+            .reshape(bsz, self.num_heads, v_self.size(2), self.head_dim)
+        )
 
         # here we implement the cog  self-Attention:
         # Raw scores
@@ -229,6 +276,13 @@ class DiT_Block(nn.Module):
 
 
 class CompDiTModel(nn.Module):
+    """
+    The Core Latent Diffusion KV Compressor.
+
+    Wraps the DiT blocks. Orchestrates the iterative denoising process
+    over a sequence of latent tokens, conditioned on the LLM's uncompressed KV cache.
+    """
+
     def __init__(self):
         super().__init__()
         self.config = ModelConfig()
@@ -248,19 +302,28 @@ class CompDiTModel(nn.Module):
             nn.Linear(self.config.intermediate_size, self.config.hidden_size),
         )
 
-    def forward(self, latent_states, Latent_KVs, kv_caches, timestep, start_pos=0):
+    def forward(
+        self,
+        latent_states: torch.Tensor,
+        Latent_KVs: torch.Tensor,
+        kv_caches: torch.Tensor,
+        timestep: int,
+        start_pos: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        latent_states: torch.Tensor of shape (batch_size, K_latent_len, hidden_size)
-                    [Latent Tokens of Diffusion]
+        Forward pass for the full Diffusion sequence at a specific timestep.
 
-        Latent_KVs: same as kv_caches but for DiT self Model
-        kv_caches: torch.Tensor of shape (
-                                    B, num_hidden_layers, seq_len, 2, num_heads, head_dim
-                                ) [KVs from AR forward passes + Compressed KVs too]
+        Args:
+            latent_states (torch.Tensor): Shape (B, K_latent_len, hidden_size). Noisy latents.
+            Latent_KVs (torch.Tensor, optional):
+                Self-attention KV cache of latents from prior steps.
+            kv_caches (torch.Tensor):
+                Shape (B, layers, seq_len, 2, heads, dim). LLM uncompressed KVs.
+            timestep (int): The current diffusion step.
+            start_pos (int, optional): Spatial start position to anchor the Strided RoPE.
 
-        timestep: int [the step of diffusion]
-        start_pos: int [Start-position of uncompressed KVs in KV-caches which we are
-                         going to compress]
+        Returns:
+            Tuple of the refined latent_states and updated Latent_KVs.
         """
 
         _, K_latent_len, _ = latent_states.shape
@@ -273,8 +336,8 @@ class CompDiTModel(nn.Module):
         # Generate strided position-ids
         # This ensures that noise token 'i' is associated with position 'i * X_factor'
         # Example: If X_factor=2, IDs are start_pos + [0, 2, 4, 6, ...] from start_pos
-        # need to implement the possition_id profiling,..... where do we need and what
-        # type of profile... exponential decaying, uniform, ...TODO
+        # TODO: need to implement the position_id profiling,.. where do we need and
+        # what type of profile...exponential decaying, uniform, ...
         position_ids = torch.arange(
             start_pos,
             start_pos + K_latent_len * self.X_factor,

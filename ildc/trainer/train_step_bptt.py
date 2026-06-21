@@ -1,18 +1,14 @@
-# ===================================================================================
-
-# ===================================================================================
-
 import torch
 import torch.nn.functional as F
 
 
-# ============================================================================
 # Latent Knowledge Distillation
+# ===================================================================================
+
+
 def train_step(
     ILDC_model: torch.nn.Module,
     full_batch: torch.Tensor,
-    past_len: int,
-    diff_steps: int = 1,
     config=None,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -25,8 +21,6 @@ def train_step(
     Args:
         ILDC_model: The wrapper model containing AR and DC architectures.
         full_batch (torch.Tensor): Shape (B, Total_S). The full sequence of tokens.
-        past_len (int): Length of the context to be compressed.
-        diff_steps (int): Total diffusion steps to unroll.
         config: TrainingConfig object.
 
     Returns:
@@ -36,6 +30,9 @@ def train_step(
     device = full_batch.device
     B, Total_S = full_batch.shape
 
+    Tdiff_steps = config.total_diffusion_steps
+    past_len = config.past_len
+
     context_tokens = full_batch[:, :past_len]
 
     # Assuming full_batch contains the full sequence including the target for the last token
@@ -43,15 +40,13 @@ def train_step(
     labels = full_batch[:, past_len + 1 :]
 
     # Model Inference
-    train_output, T_latent_states = ILDC_model(
+    train_output, T_latent_states = ILDC_model.bptt_forward(
         input_ids=current_tokens,
         context_ids=context_tokens,
         active_kv_caches=None,
         active_compressed_kv=None,
-        latent_states=None,  # fresh new diffusion
-        start_step=0,
-        diff_steps=diff_steps,  # how many diffusion steps to be cycled
         start_pos=0,
+        Tdiff_steps=Tdiff_steps - 1,  # how many diffusion steps to be cycled
     )
 
     # Train Outputs
@@ -115,9 +110,6 @@ def train_step(
 
     # Because P_target ends up as a one-hot vector at the final step,
     # this KL Divergence call mathematically calculates Exact Cross-Entropy at step T!
-    # unified_logit_loss = F.kl_div(student_log_P, P_target, reduction='none')
-    # Instead of: F.kl_div(log_probs, targets)
-    # Use:
     eps = 1e-7
     unified_logit_loss = P_target * (torch.log(P_target + eps) - student_log_P)
 
@@ -131,19 +123,9 @@ def train_step(
     # MSE on hidden states ensures the DM Tower learns to reconstruct the continuous KV cache
     mse_loss = F.mse_loss(student_h, h_teacher_exp, reduction="none").mean(dim=-1)
 
-    # # Progressive Refinement: penalize if latent distance INCREASES between steps
-    # dist_to_teacher = mse_loss.mean(dim=(0, 2))
-    # improvement_loss = F.relu(dist_to_teacher[1:] - dist_to_teacher[:-1]).mean()
-
     # Final Loss
     total_loss = unified_logit_loss + (config.lambda_latent * mse_loss.mean())
-    # (config.lambda_refine * improvement_loss)
-    # )
 
     # --- TEMPORARY CALIBRATION PRINT ---
-    loss_items = {
-        "logit_val": unified_logit_loss.item(),
-        "mse_val": mse_loss.mean().item(),
-        # "refine_val": improvement_loss.item()
-    }
+    loss_items = {"logit_val": unified_logit_loss.item(), "mse_val": mse_loss.mean().item()}
     return total_loss, loss_items

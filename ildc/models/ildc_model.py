@@ -197,10 +197,8 @@ class ILDC(nn.Module):
         context_ids: torch.Tensor = None,
         active_kv_caches: torch.Tensor = None,
         active_compressed_kv: torch.Tensor = None,
-        latent_states: torch.Tensor = None,
-        start_step: int = 0,
-        diff_steps: int = 1,
         start_pos: int = None,
+        Tdiff_steps: int = 8,
     ) -> tuple[dict, torch.Tensor]:
         """
         Full Back-Propagation Through Time (BPTT) Forward Pass.
@@ -282,17 +280,21 @@ class ILDC(nn.Module):
         else:
             cond_context_kvs = uncomp_context_kvs
 
-        if latent_states is None:
-            # if No latent_states, we assume, it is the first step and so we just put
-            # a noisy latent and also make start_step = 0
-            start_step = 0
-            latent_states = torch.randn(
-                B, K_latent_len, self.config.hidden_size, device=self.device, dtype=target_dtype
-            )
+        current_ground_latent_states = torch.randn(
+            B, K_latent_len, self.config.hidden_size, device=self.device, dtype=target_dtype
+        )
+
+        latent_kvs = None
 
         # Compress the extracted KVs using the DM tower
+
         T_latent_states, T_newcompressed_kv_caches = self.kv_compress(
-            latent_states, cond_context_kvs, start_step, diff_steps, start_pos
+            current_ground_latent_states,
+            latent_kvs,
+            cond_context_kvs,
+            0,
+            Tdiff_steps,  # all the way from start to end diff steps
+            start_pos,
         )
 
         B, T, L, Comp_Seq, _, H, D = T_newcompressed_kv_caches.shape
@@ -349,7 +351,7 @@ class ILDC(nn.Module):
             "student": {"T_hidden": student_h, "T_logits": student_logits},  # (B, T, S, V)
         }
 
-        return train_output, T_latent_states
+        return train_output, T_latent_states.detach()
 
     # Implementation with memory savings: trading with compute:
     # Sifting from BPTT to single step block training implementation...

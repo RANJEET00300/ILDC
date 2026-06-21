@@ -6,7 +6,6 @@ We love your input! We want to make contributing to this project as easy and tra
 - Discussing the current state of the code
 - Submitting a fix
 - Proposing new features
-- Becoming a maintainer
 
 ## Development Environment Setup
 
@@ -19,18 +18,20 @@ We love your input! We want to make contributing to this project as easy and tra
 2. **Create a virtual environment:**
    ```bash
    python -m venv venv
-   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+   # On Windows (cmd): venv\Scripts\activate
+   # On Windows (PowerShell): .\venv\Scripts\Activate.ps1
+   # On macOS/Linux: source venv/bin/activate
+   source venv/bin/activate
    ```
 
-3. **Install dependencies:**
+3. **Install the package in editable mode with development tools:**
    ```bash
-   pip install -r requirements.txt
+   pip install -e ".[dev]"
    ```
 
 4. **Install pre-commit hooks:**
    We use `pre-commit` to ensure code formatting and quality before each commit.
    ```bash
-   pip install pre-commit
    pre-commit install
    ```
 

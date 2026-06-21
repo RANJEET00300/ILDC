@@ -1,13 +1,17 @@
-# =========================================================================
-
+# ===================================================================================
 
 import os
 import torch
 from transformers import get_cosine_schedule_with_warmup
 
 from ildc.models.ildc_model import ILDC
-from ildc.trainer.train_step_single import train_step
+from ildc.trainer.train_step_bptt import train_step
 from ildc.data.data_loader import get_wikipedia_batches
+
+"""
+ILDC Training — PyTorch CUDA
+=======================================================
+"""
 
 
 class TrainingConfig:
@@ -15,37 +19,47 @@ class TrainingConfig:
         self.model_id = "google/gemma-3-1b-it"
         self.dataset_name = "wikimedia/wikipedia"
         self.dataset_config = "20241101.en"
+        self.checkpoint_dir = "./checkpoints"
+
         self.past_len = 2048
         self.future_len = 512
         self.full_len = 2561
-        self.batch_size = 1
-        self.gradient_accumulation_steps = 32
+
         self.learning_rate = 1e-4
-        self.epochs = 10
-        self.checkpoint_dir = "kaggle/working/checkpoints/dc_model_step_100.pt"
+        self.lambda_latent = 0.1
+
         self.log_every = 1
         self.save_every = 100
-        self.lambda_latent = 0.1
-        self.lambda_refine = 9.0
-        self.diffusion_steps = 2  # hard training with BPTT
-        self.N_batches = 16384
+
+        self.batch_size = 1
+        self.gradient_accumulation_steps = 32
+        self.total_diffusion_steps = 8
+        self.diff_steps = 2  # hard training with Block, 2 steps per/
+
+        self.N_batches = 16284
+        self.epochs = self.total_diffusion_steps - self.diff_steps + 1
 
 
-def train_fn(index):
+def train_fn():
     config = TrainingConfig()
-    config.past_len + config.future_len + 1
 
-    device = torch.device("cuda")
-    torch.cuda.device_count()
-    rank = 0
+    # 1. SETUP CUDA DEVICE
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    print("=" * 60)
+    print("  ILDC Stage 1 Warm-up Training (PyTorch CUDA / GPU)")
+    print(f"  Using device: {device}")
+    if torch.cuda.is_available():
+        print(f"  GPU Model: {torch.cuda.get_device_name(0)}")
+    print("=" * 60)
+
+    # 2. DATALOADER (Standard PyTorch iteration)
     dataloader = get_wikipedia_batches(
         tokenizer_path=config.model_id,
         batch_size=config.batch_size,
         required_length=config.full_len,
         max_batches=config.N_batches,
     )
-    mp_dataloader = dataloader
 
     print("Loading ILDC Model...")
     ILDC_model = ILDC(config.checkpoint_dir, device)
@@ -57,8 +71,8 @@ def train_fn(index):
         [{"params": ILDC_model.dc_model.parameters(), "lr": 1e-4, "weight_decay": 0.01}]
     )
 
-    if rank == 0:
-        os.makedirs(config.checkpoint_dir, exist_ok=True)
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+
     # ==============================================================================
     # 2. SCHEDULER SETUP (COSINE + WARMUP)
     # ==============================================================================
@@ -86,19 +100,22 @@ def train_fn(index):
     for epoch in range(config.epochs):
         optimizer.zero_grad()
 
-        for batch_idx, full_batch in enumerate(mp_dataloader):
+        for batch_idx, full_batch in enumerate(dataloader):
+            # Move the batch explicitly to the CUDA device
+            input_ids = full_batch["input_ids"].to(device)
+
             # --- A. Forward Pass ---
-            train_loss, loss_items = train_step(
-                ILDC_model, full_batch["input_ids"], config.past_len, config.diffusion_steps, config
-            )
+            # Note: Changed `config.diffusion_steps` to `config.total_diffusion_steps`
+            # to match the attributes available in TrainingConfig
+            train_loss, loss_items = train_step(ILDC_model, input_ids, config)
 
             # --- B. Gradient Accumulation Scaling ---
             # We divide the loss so the accumulated gradients equal a true large batch
             loss_to_backward = train_loss / grad_accum_steps
             loss_to_backward.backward()
 
-            # Update running trackers (Detached from graph for memory safety)
-            running_loss += train_loss.detach()
+            # Update running trackers (Using .item() for memory safety on CUDA)
+            running_loss += train_loss.item()
             running_logit += loss_items["logit_val"]
             running_mse += loss_items["mse_val"]
 
@@ -107,7 +124,7 @@ def train_fn(index):
                 # 1. Gradient Clipping
                 torch.nn.utils.clip_grad_norm_(ILDC_model.parameters(), max_norm=1.0)
 
-                # 2. CUDA Optimizer Step
+                # 2. Standard PyTorch Optimizer Step
                 optimizer.step()
 
                 # 3. Scheduler Step & Zero Grad
@@ -126,7 +143,7 @@ def train_fn(index):
 
                     print(
                         f"Epoch {epoch} | Step {global_step}/{total_optim_steps} | "
-                        f"Loss: {avg_loss.item():.4f} "
+                        f"Loss: {avg_loss:.4f} "
                         f"(Logit: {avg_log:.4f}, MSE: {avg_mse:.4f}) | "
                         f"LR_DM: {current_dm_lr:.2e}"
                     )
@@ -151,6 +168,7 @@ def train_fn(index):
 
 
 def main():
+    print("Launching PyTorch CUDA training on GPU...")
     train_fn()
 
 

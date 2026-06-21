@@ -10,6 +10,7 @@ def test():
     ILDC_model = ILDC(device=device)
     ILDC_model.to(torch.bfloat16)
 
+    # Autoregressive model
     AR_model = ILDC_model.ar_model
 
     with torch.no_grad():
@@ -27,6 +28,7 @@ def test():
         print(outputs["hidden_states"].shape)
         print(outputs["active_kv_caches"].shape)
 
+    # Diffusion COmpressor Model...
     DC_model = ILDC_model.dc_model
 
     with torch.no_grad():
@@ -36,7 +38,7 @@ def test():
         A, B = DC_model(latent_states, kv_caches, 1)
         print(A, B)
 
-    # ILDC Model
+    # ILDC Model Forward Pass with blocks...
     with torch.no_grad():
         start_step = 0
         diff_steps = 2
@@ -57,6 +59,25 @@ def test():
             start_step += diff_steps
 
             print(train_output)
+
+    # BPTT Pass
+    with torch.no_grad():
+        start_step = 0
+        Tdiff_steps = 4  # total diff steps....
+
+        active_kv_caches = (torch.randn(1, 26, 1024, 2, 1, 256).to(torch.bfloat16).to(device),)
+        (torch.randn(1, 26, 768, 2, 1, 256).to(torch.bfloat16).to(device),)
+
+        train_output = ILDC_model.bptt_forward(
+            input_ids=torch.randint(1, 26400, (1, 512)).to(device),
+            context_ids=torch.randint(1, 26400, (1, 2048)).to(device),
+            # active_kv_caches= active_kv_caches,
+            # active_compressed_kv= active_compressed_kv,
+            # start_pos=768,  # as we already have 768 compressed kvs
+            Tdiff_steps=Tdiff_steps - 1,
+        )
+
+        print(train_output)
 
     # Autoregressive Generation with Compressed KVs
 

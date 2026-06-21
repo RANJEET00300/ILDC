@@ -21,8 +21,7 @@ dev = [
     "black",
     "ruff",
     "pre-commit",
-    "pytest",
-    "jupyter",
+    "pytest"
 ]
 
 [tool.black]
@@ -32,3 +31,6 @@ target-version = ["py310"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.setuptools]
+packages = ["ildc"]
